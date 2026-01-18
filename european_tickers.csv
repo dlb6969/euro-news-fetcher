@@ -1,0 +1,96 @@
+ticker,country,name
+SAP.DE,Germany,SAP SE
+SIE.DE,Germany,Siemens AG
+ALV.DE,Germany,Allianz SE
+DTE.DE,Germany,Deutsche Telekom AG
+BAS.DE,Germany,BASF SE
+BAYN.DE,Germany,Bayer AG
+MBG.DE,Germany,Mercedes-Benz Group AG
+BMW.DE,Germany,BMW AG
+MUV2.DE,Germany,Munich Re
+ADS.DE,Germany,Adidas AG
+DBK.DE,Germany,Deutsche Bank AG
+VOW3.DE,Germany,Volkswagen AG
+DHL.DE,Germany,DHL Group
+AIR.DE,Germany,Airbus SE
+IFX.DE,Germany,Infineon Technologies AG
+RWE.DE,Germany,RWE AG
+HEN3.DE,Germany,Henkel AG
+DB1.DE,Germany,Deutsche Boerse AG
+FRE.DE,Germany,Fresenius SE
+EOAN.DE,Germany,E.ON SE
+BEI.DE,Germany,Beiersdorf AG
+CON.DE,Germany,Continental AG
+HEI.DE,Germany,HeidelbergCement AG
+MTX.DE,Germany,MTU Aero Engines AG
+SY1.DE,Germany,Symrise AG
+MC.PA,France,LVMH
+OR.PA,France,L'Oreal SA
+TTE.PA,France,TotalEnergies SE
+SAN.PA,France,Sanofi SA
+AI.PA,France,Air Liquide SA
+AIR.PA,France,Airbus SE
+BNP.PA,France,BNP Paribas SA
+SU.PA,France,Schneider Electric SE
+EL.PA,France,EssilorLuxottica SA
+CS.PA,France,AXA SA
+RI.PA,France,Pernod Ricard SA
+DG.PA,France,Vinci SA
+KER.PA,France,Kering SA
+CAP.PA,France,Capgemini SE
+SGO.PA,France,Saint-Gobain SA
+VIV.PA,France,Vivendi SE
+HO.PA,France,Thales SA
+SAF.PA,France,Safran SA
+ORA.PA,France,Orange SA
+BN.PA,France,Danone SA
+EN.PA,France,Bouygues SA
+GLE.PA,France,Societe Generale SA
+CA.PA,France,Carrefour SA
+LR.PA,France,Legrand SA
+STMPA.PA,France,STMicroelectronics NV
+SHEL.L,UK,Shell PLC
+AZN.L,UK,AstraZeneca PLC
+HSBA.L,UK,HSBC Holdings PLC
+ULVR.L,UK,Unilever PLC
+BP.L,UK,BP PLC
+GSK.L,UK,GSK PLC
+RIO.L,UK,Rio Tinto PLC
+REL.L,UK,RELX PLC
+DGE.L,UK,Diageo PLC
+BATS.L,UK,British American Tobacco PLC
+LSEG.L,UK,London Stock Exchange Group PLC
+NG.L,UK,National Grid PLC
+AAL.L,UK,Anglo American PLC
+LLOY.L,UK,Lloyds Banking Group PLC
+BARC.L,UK,Barclays PLC
+VOD.L,UK,Vodafone Group PLC
+CPG.L,UK,Compass Group PLC
+PRU.L,UK,Prudential PLC
+IMB.L,UK,Imperial Brands PLC
+ABF.L,UK,Associated British Foods PLC
+RR.L,UK,Rolls-Royce Holdings PLC
+EXPN.L,UK,Experian PLC
+AHT.L,UK,Ashtead Group PLC
+SSE.L,UK,SSE PLC
+NXT.L,UK,Next PLC
+ASML.AS,Netherlands,ASML Holding NV
+INGA.AS,Netherlands,ING Groep NV
+PHIA.AS,Netherlands,Koninklijke Philips NV
+UNA.AS,Netherlands,Unilever NV
+HEIA.AS,Netherlands,Heineken NV
+ABN.AS,Netherlands,ABN AMRO Bank NV
+WKL.AS,Netherlands,Wolters Kluwer NV
+DSM.AS,Netherlands,DSM-Firmenich AG
+KPN.AS,Netherlands,Koninklijke KPN NV
+AGN.AS,Netherlands,Aegon NV
+RAND.AS,Netherlands,Randstad NV
+ADYEN.AS,Netherlands,Adyen NV
+NN.AS,Netherlands,NN Group NV
+AD.AS,Netherlands,Ahold Delhaize NV
+ASR.AS,Netherlands,ASR Nederland NV
+AKZA.AS,Netherlands,Akzo Nobel NV
+MT.AS,Netherlands,ArcelorMittal SA
+IMCD.AS,Netherlands,IMCD NV
+LIGHT.AS,Netherlands,Signify NV
+PRX.AS,Netherlands,Prosus NV
