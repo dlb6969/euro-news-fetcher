@@ -15,6 +15,8 @@ import requests
 import os
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 
 
 # Load environment variables
@@ -23,6 +25,7 @@ load_dotenv(Path(__file__).parent / ".env")
 # File paths
 TICKERS_FILE = Path(__file__).parent / "european_tickers.csv"
 KEYWORDS_FILE = Path(__file__).parent / "news_keywords.txt"
+BLOCKED_SOURCES_FILE = Path(__file__).parent / "blocked_sources.txt"
 
 # Finnhub API Key from environment
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
@@ -44,6 +47,86 @@ EUROPEAN_INDICES = {
     "OBX": "^OBX",
     "WIG20": "WIG20.WA",
 }
+
+# News Impact Scoring - Source Tiers (0-30 points)
+SOURCE_TIERS = {
+    # Tier 1 - Official/Primary Sources (30 points)
+    "reuters": 30, "bloomberg": 30, "pr newswire": 30, "prnewswire": 30,
+    "businesswire": 30, "business wire": 30, "globenewswire": 30,
+    "globe newswire": 30, "accesswire": 30, "company press release": 30,
+    # Tier 2 - Major Financial News (25 points)
+    "cnbc": 25, "financial times": 25, "ft.com": 25, "wall street journal": 25,
+    "wsj": 25, "marketwatch": 25, "barron's": 25, "barrons": 25,
+    # Tier 3 - Quality Financial Sources (18 points)
+    "yahoo finance": 18, "yahoo": 18, "investing.com": 18, "morningstar": 18,
+    "thestreet": 18, "the street": 18,
+    # Tier 4 - Aggregators (12 points)
+    "benzinga": 12, "tipranks": 12, "zacks": 12, "finviz": 12,
+    # Tier 5 - Blogs/Low Quality (5 points)
+    "seekingalpha": 5, "seeking alpha": 5, "motley fool": 5, "fool.com": 5,
+    "investorplace": 5, "investor place": 5, "24/7 wall st": 5,
+}
+
+# News Impact Scoring - Keywords
+IMPACT_KEYWORDS_HIGH = [
+    "guidance", "outlook", "forecast", "profit warning", "warning",
+    "earnings", "quarterly results", "annual results", "results",
+    "upgrade", "downgrade", "price target", "target raised", "target cut",
+    "acquisition", "merger", "takeover", "bid", "deal",
+    "ceo", "cfo", "management change", "appoints", "resigns",
+    "dividend", "buyback", "share repurchase", "restructuring",
+    "bankruptcy", "insolvency", "delisting",
+]
+
+IMPACT_KEYWORDS_NEUTRAL = [
+    "beat", "miss", "revenue", "eps", "sales", "profit", "loss",
+    "growth", "decline", "increase", "decrease",
+]
+
+IMPACT_KEYWORDS_NEGATIVE = [
+    "preview", "what to expect", "ahead of", "looking ahead",
+    "blog", "opinion", "commentary", "analysis",
+    "review", "roundup", "weekly recap", "monthly recap",
+    "top stocks", "stocks to watch", "best stocks", "worst stocks",
+    "picks", "portfolio", "investment ideas",
+]
+
+# Blog/Non-Breaking News Title Patterns (for filtering)
+BLOG_TITLE_PATTERNS = [
+    # Listicles and roundups
+    r"\d+\s+(stocks?|reasons?|things?|ways?)\s+to",
+    r"top\s+\d+\s+",
+    r"best\s+\d+\s+",
+    r"\d+\s+best\s+",
+    # Opinion/Analysis indicators
+    r"^why\s+(i|you|we)\s+",
+    r"^my\s+",
+    r"here'?s\s+why",
+    r"should\s+you\s+(buy|sell|invest)",
+    r"is\s+it\s+time\s+to\s+(buy|sell)",
+    r"is\s+.+\s+a\s+(buy|sell|hold)",
+    # Previews and speculation
+    r"what\s+to\s+(expect|watch|know)",
+    r"could\s+(soar|surge|plunge|crash|rally)",
+    r"(might|may|could)\s+be\s+(the\s+next|a\s+buy)",
+    # Weekly/Monthly summaries
+    r"(week|month)\s+in\s+review",
+    r"(weekly|monthly|daily)\s+(recap|roundup|summary)",
+    r"this\s+week\s+in\s+",
+    # Stock picks and recommendations
+    r"stock\s+pick",
+    r"stocks?\s+to\s+(buy|sell|watch|avoid)",
+    r"(buy|sell)\s+alert",
+    # Question-based clickbait
+    r"^is\s+.+\s+stock\s+",
+    r"^can\s+.+\s+stock\s+",
+    r"^will\s+.+\s+stock\s+",
+]
+
+# Pre-compile blog patterns for performance (compiled once at module load)
+COMPILED_BLOG_PATTERNS = [re.compile(pattern, re.IGNORECASE) for pattern in BLOG_TITLE_PATTERNS]
+
+
 
 
 def load_tickers_from_csv() -> List[str]:
@@ -71,6 +154,287 @@ def save_keywords(keywords: List[str]):
     """Save keywords to file."""
     with open(KEYWORDS_FILE, "w") as f:
         f.write("\n".join(keywords))
+
+
+@lru_cache(maxsize=1)
+def _load_blocked_sources_cached() -> tuple:
+    """Load blocked news sources from file (cached as tuple for hashability)."""
+    if BLOCKED_SOURCES_FILE.exists():
+        with open(BLOCKED_SOURCES_FILE, "r") as f:
+            sources = []
+            for line in f:
+                line = line.strip().lower()
+                # Skip comments and empty lines
+                if line and not line.startswith("#"):
+                    sources.append(line)
+            return tuple(sources)
+    return tuple()
+
+
+def load_blocked_sources() -> List[str]:
+    """Load blocked news sources from file (cached)."""
+    return list(_load_blocked_sources_cached())
+
+
+def is_blocked_source(publisher: str) -> bool:
+    """Check if a publisher is in the blocked sources list."""
+    if not publisher:
+        return False
+    publisher_lower = publisher.lower()
+    blocked = _load_blocked_sources_cached()  # Use cached tuple directly
+    return any(blocked_source in publisher_lower for blocked_source in blocked)
+
+
+def is_blog_content(title: str) -> bool:
+    """Check if a news title appears to be blog/opinion content rather than breaking news."""
+    if not title:
+        return False
+    # Use pre-compiled patterns for performance (no need to lowercase - patterns are case-insensitive)
+    for pattern in COMPILED_BLOG_PATTERNS:
+        if pattern.search(title):
+            return True
+    return False
+
+
+def filter_quality_news(news_items: List[Dict]) -> List[Dict]:
+    """Filter out blocked sources and blog content from news items."""
+    filtered = []
+    for item in news_items:
+        publisher = item.get("publisher", "")
+        title = item.get("title", "")
+
+        # Skip blocked sources
+        if is_blocked_source(publisher):
+            continue
+
+        # Skip blog content
+        if is_blog_content(title):
+            continue
+
+        filtered.append(item)
+    return filtered
+
+
+def format_news_timestamp(timestamp: int) -> str:
+    """Format Unix timestamp to readable date/time string."""
+    if not timestamp or timestamp <= 0:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(timestamp)
+        now = datetime.now()
+        # If today, show time only
+        if dt.date() == now.date():
+            return dt.strftime("%H:%M")
+        # If this year, show month/day and time
+        elif dt.year == now.year:
+            return dt.strftime("%b %d %H:%M")
+        # Otherwise show full date
+        else:
+            return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+# News Impact Scoring Functions
+def get_source_tier_score(publisher: str) -> int:
+    """Calculate source tier score (0-30 points) based on publisher reputation."""
+    if not publisher:
+        return 5  # Default low score for unknown
+    publisher_lower = publisher.lower()
+
+    # Check for exact or partial matches in SOURCE_TIERS
+    for source, score in SOURCE_TIERS.items():
+        if source in publisher_lower:
+            return score
+
+    return 10  # Default score for unlisted sources
+
+
+def calculate_keyword_score(title: str) -> int:
+    """Calculate keyword-based score (0-40 points, can go negative before clamping)."""
+    if not title:
+        return 0
+
+    title_lower = title.lower()
+    score = 0
+
+    # High-impact keywords: +10 each, max 40
+    high_impact_count = 0
+    for keyword in IMPACT_KEYWORDS_HIGH:
+        if keyword in title_lower:
+            high_impact_count += 1
+    score += min(40, high_impact_count * 10)
+
+    # Neutral keywords: +3 each
+    for keyword in IMPACT_KEYWORDS_NEUTRAL:
+        if keyword in title_lower:
+            score += 3
+
+    # Negative keywords: -15 each
+    for keyword in IMPACT_KEYWORDS_NEGATIVE:
+        if keyword in title_lower:
+            score -= 15
+
+    return score
+
+
+def calculate_time_decay_score(timestamp: int, half_life_hours: int = 24) -> int:
+    """Calculate time decay score (0-30 points) using half-life formula.
+
+    Formula: score = 30 * (0.5 ^ (hours_old / half_life_hours))
+    - Fresh news (< 1 hour): ~30 points
+    - 1 day old: ~15 points
+    - 2 days old: ~7.5 points
+    - 7 days old: ~0.2 points
+    """
+    if not timestamp or timestamp <= 0:
+        return 0  # No timestamp = no time score
+
+    current_time = datetime.now().timestamp()
+    hours_old = (current_time - timestamp) / 3600
+
+    if hours_old < 0:
+        hours_old = 0  # Future timestamps treated as fresh
+
+    # Half-life decay formula
+    score = 30 * (0.5 ** (hours_old / half_life_hours))
+    return int(round(score))
+
+
+def calculate_news_impact_score(news_item: dict) -> int:
+    """Calculate overall impact score (0-100) for a news item.
+
+    Components:
+    - Source tier: 0-30 points
+    - Keywords: 0-40 points
+    - Time decay: 0-30 points
+    """
+    score = 0
+
+    # 1. Source tier (0-30)
+    publisher = news_item.get('publisher', '')
+    score += get_source_tier_score(publisher)
+
+    # 2. Keyword analysis (0-40, can go negative before clamping)
+    title = news_item.get('title', '')
+    keyword_score = calculate_keyword_score(title)
+    score += max(0, min(40, keyword_score))  # Clamp to 0-40
+
+    # 3. Time decay (0-30)
+    timestamp = news_item.get('timestamp', 0)
+    score += calculate_time_decay_score(timestamp)
+
+    # Final clamp to 0-100
+    return max(0, min(100, score))
+
+
+def normalize_title(title: str) -> str:
+    """Normalize title for deduplication - lowercase, strip, remove punctuation."""
+    if not title:
+        return ""
+    # Lowercase and strip
+    normalized = title.lower().strip()
+    # Remove common punctuation and extra spaces
+    normalized = re.sub(r'[^\w\s]', '', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized)
+    return normalized
+
+
+def deduplicate_news(news_items: List[Dict]) -> List[Dict]:
+    """Group news by normalized title, consolidating tickers.
+
+    Returns deduplicated list where same headline affecting multiple tickers
+    shows as single item with 'tickers' list.
+    """
+    seen = {}  # key: normalized_title -> news_item with tickers list
+
+    for item in news_items:
+        key = normalize_title(item.get('title', ''))
+        if not key:
+            continue
+
+        ticker = item.get('ticker', '')
+
+        if key in seen:
+            # Add ticker to existing item's ticker list
+            if ticker and ticker not in seen[key]['tickers']:
+                seen[key]['tickers'].append(ticker)
+            # Keep the higher score version
+            if item.get('impact_score', 0) > seen[key].get('impact_score', 0):
+                seen[key]['impact_score'] = item.get('impact_score', 0)
+        else:
+            # First occurrence - create entry with tickers list
+            seen[key] = {
+                **item,
+                'tickers': [ticker] if ticker else []
+            }
+
+    return list(seen.values())
+
+
+def filter_recent_news(news_items: List[Dict], max_days: int = 7) -> List[Dict]:
+    """Filter news to only include items from last N days."""
+    if not news_items:
+        return []
+
+    cutoff = datetime.now().timestamp() - (max_days * 24 * 3600)
+
+    filtered = []
+    for item in news_items:
+        timestamp = item.get('timestamp', 0)
+        # If no timestamp, include it (we can't determine age)
+        if timestamp == 0 or timestamp >= cutoff:
+            filtered.append(item)
+
+    return filtered
+
+
+def process_news_for_display(news_items: List[Dict], max_days: int = 7, dedupe: bool = True, filter_quality: bool = True) -> List[Dict]:
+    """Full news processing pipeline: filter → quality filter → score → dedupe → sort.
+
+    Args:
+        news_items: List of news items with ticker, title, publisher, link, timestamp
+        max_days: Maximum age of news in days (default 7)
+        dedupe: Whether to deduplicate by title (default True)
+        filter_quality: Whether to filter out blocked sources and blog content (default True)
+
+    Returns:
+        Processed and sorted list of news items with impact_score added
+    """
+    if not news_items:
+        return []
+
+    # 1. Filter to recent news only
+    recent_news = filter_recent_news(news_items, max_days)
+
+    # 2. Filter out blocked sources and blog content
+    if filter_quality:
+        recent_news = filter_quality_news(recent_news)
+
+    # 3. Calculate impact scores
+    for item in recent_news:
+        item['impact_score'] = calculate_news_impact_score(item)
+
+    # 4. Deduplicate (optional)
+    if dedupe:
+        processed = deduplicate_news(recent_news)
+    else:
+        processed = recent_news
+
+    # 5. Sort by impact score (highest first)
+    processed.sort(key=lambda x: x.get('impact_score', 0), reverse=True)
+
+    return processed
+
+
+def get_score_badge(score: int) -> str:
+    """Return HTML/markdown badge based on score."""
+    if score >= 80:
+        return ":green[HIGH]"
+    elif score >= 50:
+        return ":orange[MED]"
+    else:
+        return ""  # No badge for low scores
 
 
 # Finnhub integration
@@ -178,6 +542,11 @@ def fetch_market_data(tickers: List[str]) -> pd.DataFrame:
                 if pd.isna(current_price) or pd.isna(previous_close):
                     continue
 
+                # Convert GBX (pence) to GBP (pounds) for LSE stocks
+                if ticker.upper().endswith(".L"):
+                    current_price = current_price / 100
+                    previous_close = previous_close / 100
+
                 change_pct = ((current_price - previous_close) / previous_close) * 100
                 notional = current_price * (volume if not pd.isna(volume) else 0)
 
@@ -220,9 +589,9 @@ def get_currency_for_ticker(ticker: str) -> str:
         ".LS": "€",      # Portugal - EUR
         ".HE": "€",      # Finland - EUR
         ".VI": "€",      # Austria - EUR
-        ".L": "£",       # UK - GBP
-        ".ST": "kr",     # Sweden - SEK
-        ".CO": "kr",     # Denmark - DKK
+        ".L": "£",       # UK - GBP (converted from GBX)
+        ".ST": "SEK",     # Sweden - SEK
+        ".CO": "DKK",     # Denmark - DKK
         ".OL": "kr",     # Norway - NOK
         ".CH": "CHF",    # Switzerland - CHF
         ".PL": "zł",     # Poland - PLN
@@ -232,6 +601,22 @@ def get_currency_for_ticker(ticker: str) -> str:
         if ticker.upper().endswith(suffix):
             return currency
     return "€"  # Default to EUR
+
+
+def convert_to_tradingview_symbol(yahoo_symbol: str) -> str:
+    """Convert Yahoo Finance symbol to TradingView format."""
+    exchange_map = {
+        ".DE": "XETR:", ".PA": "EURONEXT:", ".AS": "EURONEXT:",
+        ".L": "LSE:", ".MI": "MIL:", ".ST": "STO:",
+        ".CO": "CSE:", ".OL": "OSL:", ".CH": "SIX:", ".WA": "GPW:",
+        ".BR": "EURONEXT:", ".MA": "BME:", ".LS": "EURONEXT:",
+        ".HE": "OMXHEX:", ".VI": "VIE:", ".PL": "GPW:"
+    }
+    for suffix, prefix in exchange_map.items():
+        if yahoo_symbol.upper().endswith(suffix):
+            base = yahoo_symbol.upper().replace(suffix, "")
+            return prefix + base
+    return yahoo_symbol  # Fallback
 
 
 def format_number(value: float) -> str:
@@ -309,7 +694,8 @@ def fetch_news_from_finnhub(symbol: str) -> List[Dict]:
             "title": item.get('headline', 'No title'),
             "publisher": item.get('source', 'Unknown'),
             "link": item.get('url', '#'),
-            "source": "finnhub"
+            "source": "finnhub",
+            "timestamp": item.get('datetime', 0)  # Unix timestamp from Finnhub
         })
 
     return parsed_news
@@ -325,17 +711,25 @@ def fetch_news_from_yfinance(symbol: str) -> List[Dict]:
 
         parsed_news = []
         for item in news:
-            news_item = {"ticker": symbol, "source": "yfinance"}
+            news_item = {"ticker": symbol, "source": "yfinance", "timestamp": 0}
 
             if 'content' in item:
                 content = item['content']
                 news_item['title'] = content.get('title', 'No title')
                 news_item['publisher'] = content.get('provider', {}).get('displayName', 'Unknown')
                 news_item['link'] = content.get('canonicalUrl', {}).get('url', '#')
+                # Extract timestamp from content.pubDate
+                pub_date = content.get('pubDate', {})
+                if isinstance(pub_date, dict):
+                    news_item['timestamp'] = pub_date.get('utc', 0)
+                elif isinstance(pub_date, (int, float)):
+                    news_item['timestamp'] = int(pub_date)
             else:
                 news_item['title'] = item.get('title', 'No title')
                 news_item['publisher'] = item.get('publisher', 'Unknown')
                 news_item['link'] = item.get('link', '#')
+                # Extract timestamp from providerPublishTime
+                news_item['timestamp'] = item.get('providerPublishTime', 0)
 
             parsed_news.append(news_item)
 
@@ -358,25 +752,46 @@ def fetch_news_for_ticker(symbol: str) -> List[Dict]:
 
 @st.cache_data(ttl=300)
 def fetch_news_for_movers(tickers: List[str]) -> List[Dict]:
-    """Fetch news for stocks moving more than 1%."""
+    """Fetch news for stocks moving more than 1% - PARALLEL."""
     all_news = []
-    for ticker in tickers[:20]:  # Limit to avoid too many requests
-        news = fetch_news_for_ticker(ticker)
-        all_news.extend(news[:3])  # Top 3 news per ticker
+    tickers_to_fetch = tickers[:20]  # Limit to avoid too many requests
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_ticker = {
+            executor.submit(fetch_news_for_ticker, ticker): ticker
+            for ticker in tickers_to_fetch
+        }
+        for future in as_completed(future_to_ticker):
+            try:
+                news = future.result()
+                all_news.extend(news[:3])  # Top 3 news per ticker
+            except Exception:
+                continue
     return all_news
 
 
 @st.cache_data(ttl=300)
 def search_news_by_keywords(tickers: List[str], keywords: List[str]) -> List[Dict]:
-    """Search news across all tickers for keyword matches."""
+    """Search news across all tickers for keyword matches - PARALLEL."""
     all_matching_news = []
 
-    for ticker in tickers:
+    def fetch_and_filter(ticker: str) -> List[Dict]:
+        """Fetch news for a ticker and filter by keywords."""
+        matching = []
         news_items = fetch_news_for_ticker(ticker)
         for item in news_items:
             title = item.get('title', '').lower()
             if any(keyword in title for keyword in keywords):
-                all_matching_news.append(item)
+                matching.append(item)
+        return matching
+
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        futures = [executor.submit(fetch_and_filter, t) for t in tickers]
+        for future in as_completed(futures):
+            try:
+                all_matching_news.extend(future.result())
+            except Exception:
+                continue
 
     return all_matching_news
 
@@ -431,13 +846,22 @@ def render_news_page(ticker: str):
 
         # Show current price info if available
         if hasattr(info, 'last_price') and info.last_price:
+            # Convert GBX to GBP for LSE stocks
+            display_price = info.last_price
+            display_prev = info.previous_close if hasattr(info, 'previous_close') and info.previous_close else None
+            if ticker.upper().endswith(".L"):
+                display_price = display_price / 100
+                if display_prev:
+                    display_prev = display_prev / 100
+            currency = get_currency_for_ticker(ticker)
+
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("Last Price", f"{info.last_price:.2f}")
+                st.metric("Last Price", f"{currency}{display_price:.2f}")
             with col2:
-                if hasattr(info, 'previous_close') and info.previous_close:
-                    change = info.last_price - info.previous_close
-                    change_pct = (change / info.previous_close) * 100
+                if display_prev:
+                    change = display_price - display_prev
+                    change_pct = (change / display_prev) * 100
                     st.metric("Change", f"{change:+.2f}", f"{change_pct:+.2f}%")
             with col3:
                 if hasattr(info, 'last_volume') and info.last_volume:
@@ -454,32 +878,68 @@ def render_news_page(ticker: str):
     news_source = news_items[0].get("source", "unknown") if news_items else "none"
     source_label = "Finnhub" if news_source == "finnhub" else "Yahoo Finance"
 
-    st.subheader(f"📰 News (via {source_label})")
+    # Process news with scoring (no deduplication for single ticker)
+    processed_news = process_news_for_display(news_items, max_days=7, dedupe=False)
 
-    if news_items:
-        for item in news_items[:15]:
+    st.subheader(f"📰 News (via {source_label}) - sorted by impact")
+
+    if processed_news:
+        # Header row with time column
+        hcol_score, hcol_time, hcol_news = st.columns([0.5, 0.8, 5.5])
+        with hcol_score:
+            st.write("**Score**")
+        with hcol_time:
+            st.write("**Time**")
+        with hcol_news:
+            st.write("**Headline**")
+
+        for item in processed_news[:15]:
             title = item.get("title", "No title")
             publisher = item.get("publisher", "Unknown")
             link = item.get("link", "#")
-            st.markdown(f"- **{title}** ({publisher}) [🔗]({link})")
+            impact_score = item.get("impact_score", 0)
+            timestamp = item.get("timestamp", 0)
+            source = item.get("source", "unknown")
+            source_tag = "FH" if source == "finnhub" else "YF"
+
+            # Format timestamp
+            time_str = format_news_timestamp(timestamp)
+
+            col_score, col_time, col_news = st.columns([0.5, 0.8, 5.5])
+            with col_score:
+                badge = get_score_badge(impact_score)
+                st.write(f"{impact_score} {badge}")
+            with col_time:
+                st.caption(time_str)
+            with col_news:
+                # Clickable headline with source indicator
+                st.markdown(f"[{title}]({link}) ({publisher}) [{source_tag}]")
     else:
         st.info("No news available for this ticker.")
 
     st.divider()
 
-    # Intraday chart
+    # TradingView Mini Chart
     st.subheader("📊 Intraday Chart")
-    try:
-        yf_ticker = yf.Ticker(ticker)
-        intraday_data = yf_ticker.history(period='1d', interval='5m')
-
-        if not intraday_data.empty:
-            chart = create_intraday_chart(intraday_data, ticker)
-            st.plotly_chart(chart, use_container_width=True)
-        else:
-            st.warning("No intraday data available for this ticker.")
-    except Exception:
-        st.warning("No intraday data available for this ticker.")
+    tv_symbol = convert_to_tradingview_symbol(ticker)
+    st.components.v1.html(f'''
+        <div class="tradingview-widget-container">
+            <div class="tradingview-widget-container__widget"></div>
+            <script src="https://s3.tradingview.com/external-embedding/embed-widget-mini-symbol-overview.js" async>
+            {{
+                "symbol": "{tv_symbol}",
+                "width": "100%",
+                "height": 220,
+                "locale": "en",
+                "dateRange": "1D",
+                "colorTheme": "light",
+                "isTransparent": false,
+                "autosize": true,
+                "largeChartUrl": ""
+            }}
+            </script>
+        </div>
+    ''', height=240)
 
 
 def render_keyword_search_page():
@@ -562,6 +1022,8 @@ def render_keyword_search_page():
 
         with st.spinner(f"Searching news across {len(tickers)} stocks for keywords: {', '.join(active_keywords[:3])}..."):
             matching_news = search_news_by_keywords(tickers, active_keywords)
+            # Process news: score, dedupe, sort by impact
+            processed_news = process_news_for_display(matching_news, max_days=7, dedupe=True)
             # Fetch market data for all tickers to get change% and volume
             market_data = fetch_market_data(tickers)
 
@@ -574,49 +1036,114 @@ def render_keyword_search_page():
                     "volume": row["Volume"]
                 }
 
-        st.subheader(f"Found {len(matching_news)} matching news items")
+        st.subheader(f"Found {len(processed_news)} news items (deduplicated)")
 
-        if matching_news:
-            # Header row
-            hcol_t, hcol_chg, hcol_vol, hcol_news = st.columns([1.2, 0.8, 0.8, 4])
-            with hcol_t:
-                st.write("**Ticker**")
-            with hcol_chg:
-                st.write("**Change**")
-            with hcol_vol:
-                st.write("**Volume**")
-            with hcol_news:
-                st.write("**News**")
+        if processed_news:
+            # Filters and Sort row
+            filter_col1, filter_col2, filter_col3, filter_col4 = st.columns([1.5, 1, 1, 1])
+            with filter_col1:
+                sort_by = st.selectbox(
+                    "Sort by",
+                    ["Impact Score (High to Low)", "Volume (High to Low)", "Change % (High to Low)", "Change % (Low to High)"],
+                    key="keyword_sort"
+                )
+            with filter_col2:
+                min_score = st.number_input("Min Score", min_value=0, max_value=100, value=0, step=10, key="keyword_min_score")
+            with filter_col3:
+                min_change = st.number_input("Min |Change%|", min_value=0.0, max_value=50.0, value=0.0, step=0.5, key="keyword_min_change")
+            with filter_col4:
+                max_results = st.number_input("Max Results", min_value=10, max_value=500, value=100, step=10, key="keyword_max_results")
 
-            for item in matching_news:
-                ticker = item.get("ticker", "")
-                title = item.get("title", "No title")
-                publisher = item.get("publisher", "Unknown")
-                link = item.get("link", "#")
+            # Enrich news items with market data for sorting
+            enriched_news = []
+            for item in processed_news:
+                tickers_list = item.get("tickers", [item.get("ticker", "")])
+                first_ticker = tickers_list[0] if tickers_list else ""
+                ticker_data = market_lookup.get(first_ticker, {})
+                enriched_news.append({
+                    **item,
+                    "change": ticker_data.get("change", 0),
+                    "volume": ticker_data.get("volume", 0)
+                })
 
-                # Get market data for this ticker
-                ticker_data = market_lookup.get(ticker, {})
-                change_pct = ticker_data.get("change", 0)
-                volume = ticker_data.get("volume", 0)
+            # Apply filters
+            filtered_news = [
+                item for item in enriched_news
+                if item.get("impact_score", 0) >= min_score
+                and abs(item.get("change", 0)) >= min_change
+            ]
 
-                display_title = title
-                for kw in active_keywords:
-                    if kw in title.lower():
-                        pattern = re.compile(re.escape(kw), re.IGNORECASE)
-                        display_title = pattern.sub(f"**{kw.upper()}**", display_title)
+            # Sort based on selection
+            if "Impact Score" in sort_by:
+                filtered_news.sort(key=lambda x: x.get("impact_score", 0), reverse=True)
+            elif "Volume" in sort_by:
+                filtered_news.sort(key=lambda x: x["volume"], reverse=True)
+            elif "High to Low" in sort_by:
+                filtered_news.sort(key=lambda x: x["change"], reverse=True)
+            else:  # Low to High
+                filtered_news.sort(key=lambda x: x["change"], reverse=False)
 
-                col_ticker, col_chg, col_vol, col_news = st.columns([1.2, 0.8, 0.8, 4])
-                with col_ticker:
-                    if st.button(ticker, key=f"news_{ticker}_{hash(title)}"):
-                        st.query_params["ticker"] = ticker
-                        st.rerun()
-                with col_chg:
-                    color = "green" if change_pct >= 0 else "red"
-                    st.write(f":{color}[{change_pct:+.2f}%]")
-                with col_vol:
-                    st.write(format_volume(volume))
-                with col_news:
-                    st.markdown(f"{display_title} ({publisher}) [🔗]({link})")
+            # Limit results
+            filtered_news = filtered_news[:max_results]
+
+            st.caption(f"Showing {len(filtered_news)} of {len(enriched_news)} results after filters")
+
+            # Scrollable container with fixed height
+            with st.container(height=600):
+                # Header row with score column
+                hcol_score, hcol_time, hcol_t, hcol_chg, hcol_news = st.columns([0.4, 0.6, 1.0, 0.6, 4.5])
+                with hcol_score:
+                    st.write("**Score**")
+                with hcol_time:
+                    st.write("**Time**")
+                with hcol_t:
+                    st.write("**Ticker(s)**")
+                with hcol_chg:
+                    st.write("**Chg%**")
+                with hcol_news:
+                    st.write("**Headline**")
+
+                for item in filtered_news:
+                    tickers_list = item.get("tickers", [item.get("ticker", "")])
+                    first_ticker = tickers_list[0] if tickers_list else ""
+                    title = item.get("title", "No title")
+                    publisher = item.get("publisher", "Unknown")
+                    link = item.get("link", "#")
+                    change_pct = item.get("change", 0)
+                    impact_score = item.get("impact_score", 0)
+                    timestamp = item.get("timestamp", 0)
+                    source = item.get("source", "unknown")
+                    source_tag = "FH" if source == "finnhub" else "YF"
+
+                    # Format timestamp
+                    time_str = format_news_timestamp(timestamp)
+
+                    # Highlight keywords in title
+                    display_title = title
+                    for kw in active_keywords:
+                        if kw in title.lower():
+                            pattern = re.compile(re.escape(kw), re.IGNORECASE)
+                            display_title = pattern.sub(f"**{kw.upper()}**", display_title)
+
+                    col_score, col_time, col_ticker, col_chg, col_news = st.columns([0.4, 0.6, 1.0, 0.6, 4.5])
+                    with col_score:
+                        badge = get_score_badge(impact_score)
+                        st.write(f"{impact_score} {badge}")
+                    with col_time:
+                        st.caption(time_str)
+                    with col_ticker:
+                        ticker_display = ", ".join(tickers_list[:2])
+                        if len(tickers_list) > 2:
+                            ticker_display += f" +{len(tickers_list)-2}"
+                        if st.button(ticker_display, key=f"news_{first_ticker}_{hash(title)}"):
+                            st.query_params["ticker"] = first_ticker
+                            st.rerun()
+                    with col_chg:
+                        color = "green" if change_pct >= 0 else "red"
+                        st.write(f":{color}[{change_pct:+.1f}%]")
+                    with col_news:
+                        # Clickable headline with source indicator
+                        st.markdown(f"[{display_title}]({link}) ({publisher}) [{source_tag}]")
         else:
             st.info("No news found matching the keywords.")
 
@@ -768,7 +1295,7 @@ def render_home_page():
         st.divider()
         keywords = load_keywords()
         st.subheader(f"📰 Keyword News for Stocks Moving >1%")
-        st.caption(f"Filtering by: {', '.join(keywords[:5])}{'...' if len(keywords) > 5 else ''}")
+        st.caption(f"Filtering by: {', '.join(keywords[:5])}{'...' if len(keywords) > 5 else ''} | Sorted by impact score")
 
         # Create lookup for market data
         movers_lookup = {}
@@ -780,35 +1307,47 @@ def render_home_page():
 
         with st.spinner("Loading news for movers..."):
             movers_news = fetch_news_for_movers(big_movers_tickers)
-            # Filter by keywords
-            filtered_news = []
+            # Filter by keywords first
+            keyword_filtered = []
             for item in movers_news:
                 title = item.get("title", "").lower()
                 if any(kw in title for kw in keywords):
-                    filtered_news.append(item)
+                    keyword_filtered.append(item)
+            # Process news: score, dedupe, sort by impact
+            processed_news = process_news_for_display(keyword_filtered, max_days=7, dedupe=True)
 
-        if filtered_news:
-            # Header row
-            hcol_t, hcol_chg, hcol_vol, hcol_news = st.columns([1.2, 0.8, 0.8, 4])
+        if processed_news:
+            # Header row with score and time columns
+            hcol_score, hcol_time, hcol_t, hcol_chg, hcol_news = st.columns([0.4, 0.6, 1.0, 0.6, 4.5])
+            with hcol_score:
+                st.write("**Score**")
+            with hcol_time:
+                st.write("**Time**")
             with hcol_t:
-                st.write("**Ticker**")
+                st.write("**Ticker(s)**")
             with hcol_chg:
-                st.write("**Change**")
-            with hcol_vol:
-                st.write("**Volume**")
+                st.write("**Chg%**")
             with hcol_news:
-                st.write("**News**")
+                st.write("**Headline**")
 
-            for item in filtered_news[:20]:
-                ticker = item.get("ticker", "")
+            for item in processed_news[:20]:
+                # Handle deduplicated news (may have multiple tickers)
+                tickers = item.get("tickers", [item.get("ticker", "")])
                 title = item.get("title", "No title")
                 publisher = item.get("publisher", "Unknown")
                 link = item.get("link", "#")
+                impact_score = item.get("impact_score", 0)
+                timestamp = item.get("timestamp", 0)
+                source = item.get("source", "unknown")
+                source_tag = "FH" if source == "finnhub" else "YF"
 
-                # Get market data for this ticker
-                ticker_data = movers_lookup.get(ticker, {})
+                # Format timestamp
+                time_str = format_news_timestamp(timestamp)
+
+                # Get market data for first ticker (for display)
+                first_ticker = tickers[0] if tickers else ""
+                ticker_data = movers_lookup.get(first_ticker, {})
                 change_pct = ticker_data.get("change", 0)
-                volume = ticker_data.get("volume", 0)
 
                 # Highlight keywords
                 display_title = title
@@ -817,18 +1356,26 @@ def render_home_page():
                         pattern = re.compile(re.escape(kw), re.IGNORECASE)
                         display_title = pattern.sub(f"**{kw.upper()}**", display_title)
 
-                col_ticker, col_chg, col_vol, col_news = st.columns([1.2, 0.8, 0.8, 4])
+                col_score, col_time, col_ticker, col_chg, col_news = st.columns([0.4, 0.6, 1.0, 0.6, 4.5])
+                with col_score:
+                    badge = get_score_badge(impact_score)
+                    st.write(f"{impact_score} {badge}")
+                with col_time:
+                    st.caption(time_str)
                 with col_ticker:
-                    if st.button(ticker, key=f"mover_{ticker}_{hash(title)}"):
-                        st.query_params["ticker"] = ticker
+                    # Show tickers as buttons
+                    ticker_display = ", ".join(tickers[:2])
+                    if len(tickers) > 2:
+                        ticker_display += f" +{len(tickers)-2}"
+                    if st.button(ticker_display, key=f"mover_{first_ticker}_{hash(title)}"):
+                        st.query_params["ticker"] = first_ticker
                         st.rerun()
                 with col_chg:
                     color = "green" if change_pct >= 0 else "red"
-                    st.write(f":{color}[{change_pct:+.2f}%]")
-                with col_vol:
-                    st.write(format_volume(volume))
+                    st.write(f":{color}[{change_pct:+.1f}%]")
                 with col_news:
-                    st.markdown(f"{display_title} ({publisher}) [🔗]({link})")
+                    # Clickable headline with source indicator
+                    st.markdown(f"[{display_title}]({link}) ({publisher}) [{source_tag}]")
         else:
             st.info(f"No news matching keywords for stocks moving >1%.")
 
@@ -939,73 +1486,95 @@ def render_scanner_page():
                     matching_news.append(item)
 
             if matching_news:
+                # Process news items with scoring
+                processed_news = process_news_for_display(matching_news, max_days=7, dedupe=False)
+                # Get the highest scored news item
+                best_news = processed_news[0] if processed_news else matching_news[0]
+                best_score = best_news.get("impact_score", 0) if processed_news else 0
+
                 results.append({
                     "ticker": ticker,
                     "price": row["Price"],
                     "change": row["Change%"],
                     "volume": row["Volume"],
                     "notional": row["Notional"],
-                    "news": matching_news
+                    "news": processed_news if processed_news else matching_news,
+                    "best_score": best_score
                 })
 
         progress_bar.empty()
 
         if results:
-            st.success(f"Found {len(results)} stocks with relevant news!")
+            # Sort results by best news score
+            results.sort(key=lambda x: x["best_score"], reverse=True)
+
+            st.success(f"Found {len(results)} stocks with relevant news! (sorted by impact score)")
             st.divider()
 
-            # Header row
-            hcol_t, hcol_p, hcol_c, hcol_v, hcol_n, hcol_news = st.columns([1.2, 0.8, 0.8, 0.8, 0.8, 3])
+            # Header row with score and time columns
+            hcol_score, hcol_time, hcol_t, hcol_c, hcol_news = st.columns([0.4, 0.6, 1.0, 0.6, 4.5])
+            with hcol_score:
+                st.write("**Score**")
+            with hcol_time:
+                st.write("**Time**")
             with hcol_t:
                 st.write("**Ticker**")
-            with hcol_p:
-                st.write("**Price**")
             with hcol_c:
-                st.write("**Change**")
-            with hcol_v:
-                st.write("**Volume**")
-            with hcol_n:
-                st.write("**Notional**")
+                st.write("**Chg%**")
             with hcol_news:
-                st.write("**News**")
+                st.write("**Headline**")
 
             for result in results:
                 ticker = result["ticker"]
                 change = result["change"]
-                price = result["price"]
-                volume = result["volume"]
-                notional = result["notional"]
+                best_score = result["best_score"]
 
                 # Color based on direction
                 color = "green" if change > 0 else "red"
                 arrow = "🟢" if change > 0 else "🔴"
 
-                col_t, col_p, col_c, col_v, col_n, col_news = st.columns([1.2, 0.8, 0.8, 0.8, 0.8, 3])
+                # Get best news item details
+                if result["news"]:
+                    item = result["news"][0]
+                    title = item.get("title", "No title")
+                    link = item.get("link", "#")
+                    publisher = item.get("publisher", "Unknown")
+                    timestamp = item.get("timestamp", 0)
+                    source = item.get("source", "unknown")
+                    source_tag = "FH" if source == "finnhub" else "YF"
+                    time_str = format_news_timestamp(timestamp)
+
+                    # Highlight keywords
+                    display_title = title[:100] + "..." if len(title) > 100 else title
+                    for kw in scanner_keywords:
+                        if kw in display_title.lower():
+                            pattern = re.compile(re.escape(kw), re.IGNORECASE)
+                            display_title = pattern.sub(f"**{kw.upper()}**", display_title)
+                else:
+                    display_title = "No news"
+                    link = "#"
+                    publisher = ""
+                    source_tag = ""
+                    time_str = ""
+
+                col_score, col_time, col_t, col_c, col_news = st.columns([0.4, 0.6, 1.0, 0.6, 4.5])
+                with col_score:
+                    badge = get_score_badge(best_score)
+                    st.write(f"{best_score} {badge}")
+                with col_time:
+                    st.caption(time_str)
                 with col_t:
                     if st.button(f"{arrow} {ticker}", key=f"scanner_{ticker}", use_container_width=True):
                         st.query_params["ticker"] = ticker
                         st.rerun()
-                with col_p:
-                    st.write(f"{price:.2f}")
                 with col_c:
-                    st.write(f":{color}[{change:+.2f}%]")
-                with col_v:
-                    st.write(format_volume(volume))
-                with col_n:
-                    st.write(format_notional(notional))
+                    st.write(f":{color}[{change:+.1f}%]")
                 with col_news:
-                    # Show first news item inline
-                    if result["news"]:
-                        item = result["news"][0]
-                        title = item.get("title", "No title")
-                        link = item.get("link", "#")
-                        # Highlight keywords
-                        display_title = title[:80] + "..." if len(title) > 80 else title
-                        for kw in scanner_keywords:
-                            if kw in display_title.lower():
-                                pattern = re.compile(re.escape(kw), re.IGNORECASE)
-                                display_title = pattern.sub(f"**{kw.upper()}**", display_title)
-                        st.markdown(f"{display_title} [🔗]({link})")
+                    # Clickable headline with source indicator
+                    if publisher:
+                        st.markdown(f"[{display_title}]({link}) ({publisher}) [{source_tag}]")
+                    else:
+                        st.write(display_title)
         else:
             st.warning("No stocks with guidance/earnings news found among big movers.")
 
@@ -1064,7 +1633,7 @@ def fetch_tradingeconomics_earnings(country: str) -> List[Dict]:
 
 @st.cache_data(ttl=3600)
 def fetch_all_european_earnings() -> pd.DataFrame:
-    """Fetch earnings calendar for all major European countries."""
+    """Fetch earnings calendar for all major European countries - PARALLEL."""
     european_countries = [
         "germany", "united-kingdom", "france", "netherlands",
         "switzerland", "spain", "italy", "belgium", "sweden",
@@ -1072,9 +1641,17 @@ def fetch_all_european_earnings() -> pd.DataFrame:
     ]
 
     all_earnings = []
-    for country in european_countries:
-        country_earnings = fetch_tradingeconomics_earnings(country)
-        all_earnings.extend(country_earnings)
+    with ThreadPoolExecutor(max_workers=7) as executor:
+        future_to_country = {
+            executor.submit(fetch_tradingeconomics_earnings, country): country
+            for country in european_countries
+        }
+        for future in as_completed(future_to_country):
+            try:
+                country_earnings = future.result()
+                all_earnings.extend(country_earnings)
+            except Exception:
+                continue
 
     if not all_earnings:
         return pd.DataFrame()
